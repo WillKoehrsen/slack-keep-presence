@@ -9,6 +9,11 @@ Inspired by [slack-keep-presence](https://github.com/eskerda/slack-keep-presence
 - Uses websockets to connect to Slack's real time api to track presence
 - Automatically reconnects if the connection drops and comes back
 
+## Local Installation
+
+* `gem build slack_keep_presence.gemspec`
+* `gem install slack_keep_presence-{version}.gem`
+
 ## Installation
 
 ```bash

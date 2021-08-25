@@ -22,7 +22,7 @@ Gem::Specification.new do |spec|
   spec.bindir        = "bin"
   spec.executables   = ["slack-keep-presence"]
   spec.require_paths = ["lib"]
-  spec.required_ruby_version = "2.7.4"
+  spec.required_ruby_version = "~> 2.7.4"
 
   spec.add_development_dependency "bundler", "~> 2.1"
   spec.add_development_dependency "pry"
