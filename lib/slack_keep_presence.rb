@@ -8,33 +8,47 @@ require "logger"
 
 module SlackKeepPresence
   class Main
-    attr_accessor :logger, :client, :user, :ws, :should_shutdown
+    MAX_RETRIES = 5
+    RETRY_DELAY = 2 # seconds
+    attr_accessor :logger, :client, :user, :ws, :should_shutdown, :retry_count
 
     def initialize(options)
       @logger = Logger.new($stdout)
       @logger.level = options[:debug] ? Logger::DEBUG : Logger::INFO
       @client = Slack::Client.new(token: ENV["SLACK_TOKEN"])
+      @retry_count = 0
 
       get_user
       keep_presence
     end
 
     def get_user
-      auth = client.auth_test
-
-      if !auth["ok"]
-        logger.info("Unable to authenticate")
-        exit(1)
-      end
-
-      @user = auth["user_id"]
+      auth_test_with_retry
+      @user = @auth_test_result["user_id"]
       logger.info("Authenticated as #{user}")
+    end
+
+    def auth_test_with_retry
+      begin
+        @auth_test_result = client.auth_test
+        raise "Authentication failed" unless @auth_test_result["ok"]
+      rescue => e
+        if @retry_count < MAX_RETRIES
+          @retry_count += 1
+          logger.error("Authentication failed: #{e.message}, retrying...")
+          sleep RETRY_DELAY**@retry_count
+          retry
+        else
+          logger.error("Authentication failed after multiple attempts, exiting")
+          exit(1)
+        end
+      end
     end
 
     def clean_shutdown
       puts "Shutting down..."
       @should_shutdown = true
-      ws.close
+      ws.close if ws
       EM.stop
       exit
     end
@@ -64,57 +78,73 @@ module SlackKeepPresence
 
     def start_realtime
       @should_shutdown = false
+      @retry_count = 0
 
-      rtm = client.post("rtm.connect", batch_presence_aware: true)
-      ws_url = rtm["url"]
+      begin
+        rtm = client.post("rtm.connect", batch_presence_aware: true)
+        ws_url = rtm["url"]
 
-      @ws = Faye::WebSocket::Client.new(ws_url, nil, ping: 30)
+        @ws = Faye::WebSocket::Client.new(ws_url, nil, ping: 30)
 
-      ws.on :open do |_event|
-        logger.info("Connected to Slack RealTime API")
+        ws.on :open do |_event|
+          logger.info("Connected to Slack RealTime API")
 
-        payload = {
-          type: "presence_sub",
-          ids: [user]
-        }
+          payload = {
+            type: "presence_sub",
+            ids: [user]
+          }
 
-        ws.send(payload.to_json)
+          ws.send(payload.to_json)
 
-        res = client.users_getPresence(user: user)
-        logger.debug res.to_s
-      end
-
-      ws.on :message do |event|
-        data = JSON.parse(event.data)
-
-        if data["type"] == "presence_change"
-          logger.debug("Got event: #{event.data}")
-          next unless data["user"] == user
-          next unless data["presence"] == "away"
-
-          # get the status to make sure this isn't manual_away
-          away_info = client.users_getPresence(user: user)
-          logger.debug(away_info)
-
-          if away_info["manual_away"]
-            logger.info("User marked as manual_away, skipping")
-            next
-          end
-
-          logger.info("Presence changed to #{data['presence']}")
-          logger.info("Marking #{user} as active")
-
-          set_presence_active
-          restart_connection
+          res = client.users_getPresence(user: user)
+          logger.debug res.to_s
         end
+
+        ws.on :message do |event|
+          data = JSON.parse(event.data)
+
+          if data["type"] == "presence_change"
+            logger.debug("Got event: #{event.data}")
+            next unless data["user"] == user
+            next unless data["presence"] == "away"
+
+            away_info = client.users_getPresence(user: user)
+            logger.debug(away_info)
+
+            if away_info["manual_away"]
+              logger.info("User marked as manual_away, skipping")
+              next
+            end
+
+            logger.info("Presence changed to #{data['presence']}")
+            logger.info("Marking #{user} as active")
+
+            set_presence_active
+            restart_connection
+          end
+        end
+
+        ws.on [:close, :error] do |_event|
+          next if should_shutdown
+
+          logger.debug("Connection to Slack RealTime API terminated, reconnecting")
+          sleep 5
+          start_realtime
+        end
+      rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
+        handle_reconnect_failure(e)
       end
+    end
 
-      ws.on [:close, :error] do |_event|
-        next if should_shutdown
-
-        logger.debug("Connection to Slack RealTime API terminated, reconnecting")
-        sleep 5
+    def handle_reconnect_failure(exception)
+      if @retry_count < MAX_RETRIES
+        @retry_count += 1
+        logger.error("Failed to connect (#{exception.message}), retrying in #{RETRY_DELAY**@retry_count} seconds...")
+        sleep RETRY_DELAY**@retry_count
         start_realtime
+      else
+        logger.error("Failed to reconnect after multiple attempts, exiting")
+        exit(1)
       end
     end
 
@@ -122,12 +152,11 @@ module SlackKeepPresence
       @should_shutdown = true
       @ws&.close
       @ws = nil
+      @retry_count = 0
       begin
         start_realtime
-      rescue Faraday::ConnectionFailed, Faraday::TimeoutError
-        logger.info("Failed to establish connection, retrying...")
-        sleep 5
-        retry
+      rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
+        handle_reconnect_failure(e)
       end
     end
 
